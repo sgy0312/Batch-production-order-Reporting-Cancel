@@ -1,0 +1,872 @@
+*&---------------------------------------------------------------------*
+*& Report ZR_SZ_PP_111
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zr_sz_pp_111.
+TYPE-POOLS:abap,icon,vrm,sili.
+TABLES: sscrfields,icon,aufk.
+TYPES:BEGIN OF ty_excel_bg,
+        werks TYPE string,
+        aufnr TYPE string,
+        vornr TYPE string,
+        menge TYPE string,
+        budat TYPE string,
+      END OF ty_excel_bg.
+DATA:gs_excel_bg TYPE ty_excel_bg.
+TYPES:BEGIN OF ty_excel_cx,
+        werks TYPE string,
+        aufnr TYPE string,
+        rueck TYPE string,
+        rmzhl TYPE string,
+      END OF ty_excel_cx.
+DATA:gs_excel_cx TYPE ty_excel_cx.
+TYPES:BEGIN OF ty_alv,
+        msg     TYPE string,
+        icon(4),
+        werks   TYPE werks_d,     "工厂
+        aufnr   TYPE aufnr,       "订单
+        vornr   TYPE afvc-vornr,  "工序
+        menge   TYPE menge_d,     "数量
+        budat   TYPE budat,       "过账日期
+        rueck   TYPE afru-rueck,  "确认号
+        rmzhl   TYPE afru-rmzhl,  "计数器
+        uname   TYPE uname,       "操作人
+        datum   TYPE datum,       "操作时间
+        sel,
+      END OF ty_alv.
+DATA:gt_alv TYPE TABLE OF ty_alv,
+     gs_alv TYPE ty_alv.
+
+
+"定义ALV字段
+DATA :gt_fcat   TYPE lvc_t_fcat,
+      gs_layout TYPE lvc_s_layo,
+      gs_fcat   TYPE lvc_s_fcat,
+      gt_events TYPE slis_t_event,     " 设置ALV 的事件参数表
+      g_grid    TYPE REF TO cl_gui_alv_grid.
+DATA g_text TYPE char30.
+DATA: gv_functxt TYPE smp_dyntxt.
+DATA: gv_excel TYPE ole2_object,
+      gv_wbook TYPE ole2_object.
+
+SELECTION-SCREEN BEGIN OF BLOCK b0 WITH FRAME TITLE TEXT-001.
+PARAMETERS p_werks TYPE resb-werks MODIF ID m2.
+PARAMETERS: p_file TYPE rlgrap-filename MODIF ID m1 .
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-002.
+PARAMETERS :p1 RADIOBUTTON GROUP gp1 DEFAULT 'X' USER-COMMAND gp,
+            p2 RADIOBUTTON GROUP gp1.
+SELECTION-SCREEN END OF BLOCK b1.
+SELECTION-SCREEN END OF BLOCK b0.
+SELECTION-SCREEN FUNCTION KEY 1.
+
+
+INITIALIZATION.
+  gv_functxt-icon_id = icon_export. "显示图标
+  gv_functxt-quickinfo = '下载模板'.  "鼠标指向显示信息
+  gv_functxt-icon_text = '下载模板'.  "菜单文本
+  sscrfields-functxt_01 = gv_functxt.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  PERFORM frm_f4_help_for_filename.
+
+AT SELECTION-SCREEN.
+**下载模板
+  IF sscrfields-ucomm = 'FC01'.
+    PERFORM frm_download_template.
+  ENDIF.
+
+START-OF-SELECTION.
+  PERFORM frm_check_auth.
+  PERFORM frm_get_excel.
+  PERFORM frm_check_alv.
+
+END-OF-SELECTION.
+  PERFORM frm_alvshow.
+FORM frm_check_auth.
+  IF p_werks IS  INITIAL.
+    MESSAGE '工厂必输'  TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING. " 返回选择屏幕
+  ENDIF.
+  IF p_file IS INITIAL.
+    MESSAGE '请选择上载文件' TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING. " 返回选择屏幕
+  ENDIF.
+  AUTHORITY-CHECK OBJECT 'C_FVER_WRK'
+  ID 'WERKS' FIELD p_werks.
+  IF sy-subrc <> 0.
+    MESSAGE '没有工厂权限' TYPE 'S' DISPLAY LIKE 'E'.   "没有工厂权限
+    LEAVE LIST-PROCESSING. " 返回选择屏幕
+  ENDIF.
+ENDFORM.
+FORM frm_f4_help_for_filename.
+  DATA: lv_file         TYPE string,
+        lv_file_import  TYPE string,
+        lv_path_initial TYPE string,
+        lt_filetable    TYPE filetable,
+        ls_filetable    LIKE LINE OF lt_filetable,
+        lv_rc           TYPE i.
+
+  lv_file = p_file.
+
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = 'SELECT EXCEL FILE'
+      file_filter             = 'EXCEL 文件 (*.XLS;*.XLSX)|*.XLS;*.XLSX'
+    CHANGING
+      file_table              = lt_filetable
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+
+  IF lv_rc > 0.
+    READ TABLE lt_filetable INTO ls_filetable INDEX 1.
+    IF sy-subrc = 0.
+      p_file = ls_filetable-filename.
+    ELSE.
+      lv_rc = 0.
+      CLEAR:p_file.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+
+
+FORM frm_download_template.
+  DATA:lv_objdata     LIKE wwwdatatab,
+       lv_obj_name    LIKE wwwdatatab-objid,
+       lv_destination LIKE rlgrap-filename,
+       lv_objid       LIKE sy-repid,
+       lv_subrc       LIKE sy-subrc.
+  DATA:lv_ret    TYPE abap_bool,
+       lv_answer.
+  DATA:lv_file TYPE string,
+       lv_fpth TYPE string,
+       lv_fnam TYPE string.
+  DATA:lv_path TYPE char128.
+  DATA:lv_defn TYPE string.
+  DATA l_text TYPE string.
+  lv_defn = '生产订单批量报工导入模板_' && sy-datum.
+  l_text = '另存为' .
+  CALL METHOD cl_gui_frontend_services=>file_save_dialog
+    EXPORTING
+      window_title         = l_text
+      default_extension    = 'xlsx'
+      default_file_name    = lv_defn
+      file_filter          = '*.xls,*.xlsx' "cl_gui_frontend_services=>filetype_excel
+    CHANGING
+      filename             = lv_fnam
+      path                 = lv_fpth
+      fullpath             = lv_file
+    EXCEPTIONS
+      cntl_error           = 1
+      error_no_gui         = 2
+      not_supported_by_gui = 3
+      OTHERS               = 4.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+               WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  IF lv_file IS NOT INITIAL.
+    MOVE lv_file TO lv_path.
+    CONDENSE lv_path NO-GAPS.
+
+    lv_obj_name = 'ZR_SZ_PP_111'.
+
+    CREATE OBJECT gv_excel 'EXCEL.APPLICATION'.
+    GET PROPERTY OF gv_excel 'Workbooks' = gv_wbook .
+    CALL METHOD OF
+      gv_wbook
+      'Close'.
+
+    SELECT SINGLE relid objid
+      FROM wwwdata
+      INTO  CORRESPONDING FIELDS OF lv_objdata
+    WHERE srtf2 = 0 AND relid = 'MI'
+    AND objid = lv_obj_name.
+
+
+    CALL FUNCTION 'DOWNLOAD_WEB_OBJECT'
+      EXPORTING
+        key         = lv_objdata
+        destination = lv_path
+      IMPORTING
+        rc          = lv_subrc.
+    IF lv_subrc = 0.
+      p_file = lv_path.
+    ENDIF.
+
+    FREE OBJECT gv_wbook.
+    FREE OBJECT gv_excel.
+  ELSE.
+    CLEAR:sscrfields-ucomm.
+  ENDIF.
+ENDFORM.
+
+
+
+
+FORM frm_get_excel .
+  DATA: it_raw TYPE truxs_t_text_data,
+        str    TYPE i,
+        l_line TYPE i.
+  DATA ls_intern TYPE zalsmex_tabline.
+  DATA: lt_intern LIKE STANDARD TABLE OF ls_intern.
+  DATA: lv_index  TYPE i.
+  DATA p_name TYPE alsmex_tabline-value.
+  FIELD-SYMBOLS <fs_excel> TYPE any.
+  CASE 'X'.
+    WHEN p1.
+      p_name = '报工'.
+      ASSIGN gs_excel_bg TO <fs_excel>.
+    WHEN p2.
+      p_name = '冲销'.
+      ASSIGN gs_excel_cx TO <fs_excel>.
+    WHEN OTHERS.
+  ENDCASE.
+*  DATA: LS_FILE   TYPE TY_DOC.
+  FIELD-SYMBOLS: <fs> TYPE any.
+*   EXCEL上传数据
+  CALL FUNCTION 'ZALSM_EXCEL_TO_INTERNAL_TABLE3'
+    EXPORTING
+      filename                = p_file
+      i_begin_col             = 1
+      i_begin_row             = 2
+      i_end_col               = 9
+      i_end_row               = 99999
+      sheet_name              = p_name
+    TABLES
+      intern                  = lt_intern
+    EXCEPTIONS
+      inconsistent_parameters = 1
+      upload_ole              = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE s000(oo) WITH TEXT-e01 DISPLAY LIKE 'E'.
+    STOP.
+  ENDIF.
+
+* 行列排序
+  SORT lt_intern BY row ASCENDING
+                    col ASCENDING.
+
+* 导入数据转到内表
+  LOOP AT lt_intern INTO ls_intern.
+    CLEAR lv_index.
+    lv_index = CONV #( ls_intern-col ).
+*    lv_index = ls_intern-col+2(2).
+    ASSIGN COMPONENT lv_index  OF STRUCTURE <fs_excel> TO <fs>.
+    IF sy-subrc EQ 0.
+      <fs> = ls_intern-value.
+    ENDIF.
+    AT END OF row.
+      TRY.
+          MOVE-CORRESPONDING <fs_excel> TO gs_alv .
+        CATCH cx_root INTO DATA(lcx_root).
+          gs_alv-msg = lcx_root->get_longtext( ).
+          gs_alv-icon = icon_led_red.
+          APPEND gs_alv TO gt_alv.
+          CONTINUE.
+      ENDTRY.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = gs_alv-aufnr
+        IMPORTING
+          output = gs_alv-aufnr.
+      IF p2 IS NOT INITIAL.
+        gs_alv-rueck   = |{ gs_alv-rueck ALPHA = IN }|.
+        gs_alv-rmzhl   = |{ gs_alv-rmzhl ALPHA = IN }|.
+      ENDIF.
+
+      APPEND gs_alv TO gt_alv.
+      CLEAR gs_alv.
+    ENDAT.
+  ENDLOOP.
+  IF gt_alv[] IS INITIAL.
+    MESSAGE '没有数据导入' TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING. " 返回选择屏幕
+  ENDIF.
+ENDFORM.
+
+FORM frm_check_alv.
+  DATA:l_gmnga TYPE afru-gmnga,
+       l_msmng TYPE afru-gmnga.
+
+*    with +i as ( SELECT DISTINCT aufnr, werks FROM @gt_alv AS g WHERE aufnr IS NOT INITIAL AND werks IS NOT INITIAL  )
+  IF gt_alv IS NOT INITIAL.
+    SELECT aufk~aufnr,
+           aufk~werks,
+           afpo~posnr,
+           afpo~psmng
+    FROM aufk
+    INNER JOIN afpo AS afpo ON aufk~aufnr = afpo~aufnr
+    FOR ALL ENTRIES IN @gt_alv
+    WHERE aufk~aufnr = @gt_alv-aufnr
+      AND aufk~werks = @gt_alv-werks
+    INTO TABLE @DATA(lt_aufk).
+    SORT lt_aufk BY aufnr werks.
+  ENDIF.
+
+
+*  with +i as ( SELECT DISTINCT aufnr, werks FROM @gt_alv AS g WHERE aufnr IS NOT INITIAL AND werks IS NOT INITIAL  )
+*  SELECT aufk~aufnr ,
+*  aufk~werks,
+*  SUM( afpo~psmng ) AS psmng
+*  FROM aufk INNER JOIN +i AS i ON i~aufnr = aufk~aufnr
+*  AND i~werks = aufk~werks
+*  INNER JOIN afpo ON afpo~aufnr = aufk~aufnr
+*  GROUP BY aufk~aufnr,
+*  aufk~werks
+*INTO TABLE @DATA(lt_aufk).
+*  SORT lt_aufk BY aufnr werks.
+
+*  获取生产订单状态
+  IF gt_alv IS NOT INITIAL.
+    SELECT DISTINCT p~aufnr,
+                    p~stat
+    FROM pordarch AS p
+    FOR ALL ENTRIES IN @gt_alv
+    WHERE p~aufnr = @gt_alv-aufnr
+      AND p~stat IN ( 'I0076','I0046' ,'I0001' )
+      AND p~inact = ''
+    INTO TABLE @DATA(lt_pord).
+    SORT lt_pord BY aufnr.
+  ENDIF.
+
+
+*  with +i as ( SELECT DISTINCT aufnr FROM @gt_alv AS k WHERE aufnr IS NOT INITIAL  )
+*  SELECT p~aufnr,
+*  p~stat
+*  FROM pordarch AS p INNER JOIN +i AS i ON i~aufnr = p~aufnr
+*  WHERE p~stat IN ( 'I0076','I0046' ,'I0001' )
+*    AND inact = ''
+*  INTO TABLE @DATA(lt_pord).
+*  SORT lt_pord BY aufnr.
+
+
+
+  IF p1 IS NOT INITIAL.
+* 取数量
+    IF gt_alv IS NOT INITIAL.
+      SELECT afru~aufnr,
+             afru~werks,
+             afru~vornr,
+             afru~gmnga
+      FROM afru
+      FOR ALL ENTRIES IN @gt_alv
+      WHERE afru~aufnr = @gt_alv-aufnr
+        AND afru~werks = @gt_alv-werks
+        AND afru~vornr = @gt_alv-vornr
+        AND afru~stokz EQ ''
+        AND afru~stzhl EQ ''
+      INTO TABLE @DATA(lt_afru).
+      SORT lt_afru BY aufnr werks vornr.
+    ENDIF.
+
+
+*    with +i as ( SELECT DISTINCT aufnr,werks,vornr FROM @gt_alv AS g WHERE aufnr IS NOT INITIAL
+*    AND werks IS NOT INITIAL
+*    AND vornr IS NOT INITIAL )
+*    SELECT afru~aufnr,
+*    afru~werks,
+*    afru~vornr,
+*    SUM( afru~gmnga ) AS gmnga
+*    FROM afru INNER JOIN +i AS i ON i~aufnr = afru~aufnr
+*    AND i~werks = afru~werks
+*    AND i~vornr = afru~vornr
+*    WHERE afru~stokz EQ ''
+*    AND stzhl EQ ''
+*    GROUP BY afru~aufnr,
+*    afru~werks,
+*    afru~vornr
+*INTO TABLE @DATA(lt_afru).
+*    SORT lt_afru BY aufnr werks vornr.
+  ENDIF.
+
+  IF p2 IS NOT INITIAL.
+*    取确认号
+    IF gt_alv IS NOT INITIAL.
+      SELECT afru~rueck,
+             afru~rmzhl,
+             afru~aufnr,
+             afru~gmnga,
+             afru~stokz
+      FROM afru
+      FOR ALL ENTRIES IN @gt_alv
+      WHERE afru~rueck = @gt_alv-rueck
+        AND afru~rmzhl = @gt_alv-rmzhl
+      INTO TABLE @DATA(lt_afru_cx).
+      SORT lt_afru_cx BY rueck rmzhl.
+    ENDIF.
+
+*    with +i as ( SELECT DISTINCT rueck,rmzhl FROM @gt_alv AS g )
+*    SELECT afru~rueck,
+*    afru~rmzhl,
+*    afru~aufnr,
+*    afru~gmnga,
+*    afru~stokz
+*    FROM afru INNER JOIN +i AS i ON i~rueck = afru~rueck
+*                                AND i~rmzhl = afru~rmzhl
+*    INTO TABLE @DATA(lt_afru_cx)    .
+*    SORT lt_afru_cx BY rueck rmzhl.
+  ENDIF.
+
+  IF gt_alv IS NOT INITIAL.
+    SELECT afko~aufnr,
+           afvc~aufpl,
+           afvc~aplzl
+      FROM afko AS afko
+      INNER JOIN afvc AS afvc ON afko~aufpl = afvc~aufpl
+      FOR ALL ENTRIES IN @gt_alv
+      WHERE afko~aufnr = @gt_alv-aufnr
+        AND afvc~steus = 'ZJ04'
+      INTO TABLE @DATA(lt_afvc).
+    SORT lt_afvc BY aufnr.
+  ENDIF.
+
+
+
+  LOOP AT gt_alv ASSIGNING FIELD-SYMBOL(<alv>).
+    CLEAR:l_gmnga,l_msmng.
+    IF <alv>-werks IS INITIAL.
+      <alv>-msg = '工厂必输'.
+    ENDIF.
+    IF <alv>-aufnr IS INITIAL.
+      <alv>-msg = '生产订单号必输'.
+    ENDIF.
+*    报工时检验
+    IF p1 IS NOT INITIAL.
+      IF <alv>-menge IS INITIAL.
+        <alv>-msg = '报工数量必输'.
+      ENDIF.
+    ELSE.
+      IF <alv>-rueck IS INITIAL.
+        <alv>-msg = '确认号必输'.
+      ENDIF.
+      IF <alv>-rmzhl IS INITIAL.
+        <alv>-msg = '确认计数器必输'.
+      ENDIF.
+    ENDIF.
+    IF <alv>-msg IS NOT INITIAL.
+      <alv>-icon = icon_led_red.
+      CONTINUE.
+    ENDIF.
+    READ TABLE lt_aufk INTO DATA(ls_aufk) WITH KEY aufnr = <alv>-aufnr
+                                                   werks = <alv>-werks BINARY SEARCH.
+    IF sy-subrc NE 0.
+      <alv>-msg = '生产订单号' && <alv>-aufnr && '与工厂' && <alv>-werks && '不匹配'.
+    ELSE.
+      LOOP AT lt_aufk INTO ls_aufk WHERE aufnr = <alv>-aufnr AND werks = <alv>-werks.
+        l_msmng = l_msmng + ls_aufk-psmng.
+      ENDLOOP.
+    ENDIF.
+    READ TABLE lt_pord INTO DATA(ls_pord) WITH KEY aufnr = <alv>-aufnr BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      <alv>-msg = '生产订单状态不允许报工'.
+    ENDIF.
+
+    IF <alv>-msg IS NOT INITIAL.
+      <alv>-icon = icon_led_red.
+      CONTINUE.
+    ENDIF.
+    IF p1 IS NOT INITIAL.
+      READ TABLE lt_afru INTO DATA(ls_afru) WITH KEY aufnr = <alv>-aufnr
+                                                     werks = <alv>-werks
+                                                     vornr = <alv>-vornr BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        LOOP AT lt_afru INTO ls_afru WHERE aufnr = <alv>-aufnr AND werks = <alv>-werks AND vornr = <alv>-vornr.
+          l_gmnga = l_gmnga + ls_afru-gmnga.
+        ENDLOOP.
+      ENDIF.
+      IF <alv>-menge > l_msmng - l_gmnga .
+        <alv>-msg = '报工数量不允许大于工单总数量-已报工数量'.
+      ENDIF.
+      READ TABLE lt_afvc WITH KEY aufnr = <alv>-aufnr BINARY SEARCH TRANSPORTING NO FIELDS.
+      IF sy-subrc NE 0.
+        <alv>-msg = '该工序无需报工！'.
+      ENDIF.
+    ENDIF.
+
+    IF p2 IS NOT INITIAL.
+      READ TABLE lt_afru_cx INTO DATA(ls_afru_cx) WITH KEY rueck = <alv>-rueck
+                                                           rmzhl = <alv>-rmzhl BINARY SEARCH.
+      IF sy-subrc NE 0.
+        <alv>-msg = '报工确认号+计数器在系统中不存在'.
+      ELSE.
+        IF <alv>-aufnr NE ls_afru_cx-aufnr.
+          <alv>-msg = '确认号+计数器对应的生产订单与系统不匹配'.
+        ENDIF.
+        IF ls_afru_cx-stokz IS NOT INITIAL.
+          <alv>-msg = '数据已被冲销'.
+        ENDIF.
+        <alv>-menge = ls_afru_cx-gmnga.
+      ENDIF.
+    ENDIF.
+    IF <alv>-msg IS NOT INITIAL.
+      <alv>-icon = icon_led_red.
+      CONTINUE.
+    ENDIF.
+*    <alv>-budat = sy-datum.
+    <alv>-uname = sy-uname.
+    <alv>-datum = sy-datum.
+
+    CLEAR:l_gmnga,l_msmng.
+  ENDLOOP.
+ENDFORM.
+
+
+
+FORM frm_alvshow.
+  DATA is_variant TYPE disvariant.
+  REFRESH gt_fcat.
+  DEFINE fcat .
+    gs_fcat-fieldname    = &1 .
+    gs_fcat-scrtext_l    = gs_fcat-scrtext_m = gs_fcat-scrtext_s = gs_fcat-coltext = &2 .
+    gs_fcat-ref_field    = &3.
+    gs_fcat-ref_table    = &4.
+    gs_fcat-no_zero      = &5 .
+    gs_fcat-edit         = &6 .
+    gs_fcat-outputlen    = &7 .   "长度
+    gs_fcat-just = 'C'.
+    APPEND gs_fcat TO gt_fcat .
+    CLEAR  gs_fcat .
+  END-OF-DEFINITION .
+
+  gs_layout-sel_mode   = 'D'.
+  gs_layout-cwidth_opt = 'X'.
+  gs_layout-zebra      = 'X' ."斑马线显示
+  gs_layout-box_fname      = 'SEL' ."
+
+  fcat: 'ICON'       '指示灯'      ''    ''  ''  ''  ''.
+  fcat: 'MSG'        '消息'     ''    ''  ''  ''  ''.
+  fcat: 'WERKS'        '工厂'     'WERKS'    'AUFK'  ''  ''  ''.
+  fcat: 'AUFNR'        '生产订单'     'AUFNR'    'AUFK'  ''  ''  ''.
+  IF p1 IS NOT INITIAL.
+
+    fcat: 'VORNR'        '工序'     'VORNR'    'AFVC'  ''  ''  ''.
+    fcat: 'MENGE'        '报工数量'     'MENGE'    'MSEG'  ''  ''  ''.
+    fcat: 'BUDAT'        '过账日期'     'BUDAT'    'BKPF'  ''  ''  ''.
+    fcat: 'DATUM'        '报工时间'     'BUDAT'    'BKPF'  ''  ''  ''.
+    fcat: 'UNAME'        '操作人'     ''    ''  ''  ''  ''.
+    fcat: 'RUECK'        '确认号'     'RUECK'    'AFRU'  ''  ''  ''.
+    fcat: 'RMZHL'        '确认行号'     'RMZHL'    'AFRU'  ''  ''  ''.
+  ENDIF.
+  IF p2 IS NOT INITIAL.
+    fcat: 'RUECK'        '确认号'     'RUECK'    'AFRU'  ''  ''  ''.
+    fcat: 'RMZHL'        '确认行号'     'RMZHL'    'AFRU'  ''  ''  ''.
+    fcat: 'MENGE'        '冲销数量'     'MENGE'    'MSEG'  ''  ''  ''.
+    fcat: 'DATUM'        '冲销时间'     'BUDAT'    'BKPF'  ''  ''  ''.
+    fcat: 'UNAME'        '操作人'     ''    ''  ''  ''  ''.
+  ENDIF.
+
+  CASE  'X'.
+    WHEN p1.
+      is_variant-handle = '1'.
+    WHEN p2.
+      is_variant-handle = '2'.
+    WHEN OTHERS.
+  ENDCASE.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY_LVC'
+    EXPORTING
+      i_callback_program       = sy-cprog
+      is_layout_lvc            = gs_layout
+      it_fieldcat_lvc          = gt_fcat[]
+      i_save                   = 'A'
+      i_default                = 'X'
+      i_callback_user_command  = 'USER_COMMAND'
+      i_callback_pf_status_set = 'PF_STATUS'
+      it_events                = gt_events   "关联事件
+      is_variant               = is_variant
+    TABLES
+      t_outtab                 = gt_alv[]
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+    WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+ENDFORM.
+
+
+FORM pf_status USING lt_extab.
+  DATA:rt_extab TYPE slis_t_extab.
+  REFRESH:rt_extab.
+  IF p2 IS NOT INITIAL.
+    APPEND 'ZPOST' TO rt_extab.
+  ENDIF.
+  IF p1 IS NOT INITIAL.
+    APPEND 'ZPOST_CX' TO rt_extab.
+  ENDIF.
+  SET PF-STATUS 'MENU' EXCLUDING rt_extab.
+  SET TITLEBAR 'TITLT' WITH g_text.
+ENDFORM.
+
+FORM user_command USING rf_ucomm    LIKE sy-ucomm
+                        rs_selfield TYPE slis_selfield.
+  DATA : lr_grid TYPE REF TO cl_gui_alv_grid.
+  DATA : lv_stable TYPE lvc_s_stbl.
+  DATA ls_layout TYPE lvc_s_layo.
+  lv_stable-row = 'X'.
+  lv_stable-col = 'X'.
+  CALL FUNCTION 'GET_GLOBALS_FROM_SLVC_FULLSCR'
+    IMPORTING
+      e_grid = lr_grid.
+
+  CALL METHOD lr_grid->check_changed_data.
+  CASE rf_ucomm.
+    WHEN '&IC1'."双击
+      READ TABLE gt_alv INDEX rs_selfield-tabindex INTO DATA(wa_sel_temp).  "获取单击行
+      IF sy-subrc EQ 0 .
+        IF wa_sel_temp-aufnr IS NOT INITIAL.
+          SET PARAMETER ID 'ANR' FIELD wa_sel_temp-aufnr.      "
+          CALL TRANSACTION 'CO03' AND SKIP FIRST SCREEN.
+        ENDIF.
+      ENDIF.
+    WHEN 'ZPOST' . "数据导入
+      PERFORM frm_post_co11n.
+    WHEN 'ZPOST_CX'.
+      PERFORM frm_post_co13.
+  ENDCASE.
+
+*  获取ALV变化过后的布局参数
+  CALL METHOD lr_grid->get_frontend_layout
+    IMPORTING
+      es_layout = ls_layout.
+
+*重新回写自适应宽度
+  ls_layout-cwidth_opt = 'X'.
+
+*回写ALV变化过后的布局参数
+  CALL METHOD lr_grid->set_frontend_layout
+    EXPORTING
+      is_layout = ls_layout.
+
+  CALL METHOD lr_grid->refresh_table_display
+    EXPORTING
+      is_stable = lv_stable.
+  CLEAR rf_ucomm.
+
+ENDFORM.
+
+FORM frm_post_co11n.
+  LOOP AT gt_alv ASSIGNING FIELD-SYMBOL(<alv>) WHERE sel = 'X'.
+    IF <alv>-icon = icon_led_green.
+      <alv>-msg = '数据已操作，请勿重复操作'.
+      CONTINUE.
+    ENDIF.
+    PERFORM frm_call_bdc_co11n USING <alv> .
+  ENDLOOP.
+  IF sy-subrc NE 0.
+    MESSAGE '请选择需要操作的数据' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+ENDFORM.
+
+
+FORM frm_post_co13.
+  LOOP AT gt_alv ASSIGNING FIELD-SYMBOL(<alv>) WHERE sel = 'X'.
+    IF <alv>-icon = icon_led_green.
+      <alv>-msg = '数据已操作，请勿重复操作'.
+      CONTINUE.
+    ENDIF.
+    IF <alv>-icon = icon_led_red.
+      <alv>-msg = '数据存在错误，请检查并退出重新执行程序'.
+      CONTINUE.
+    ENDIF.
+    PERFORM frm_call_co13 USING <alv>.
+  ENDLOOP.
+  IF sy-subrc NE 0.
+    MESSAGE '请选择需要操作的数据' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+ENDFORM.
+
+
+FORM frm_call_bdc_co11n USING alv TYPE ty_alv.
+
+  DATA :lv_menge TYPE char30.
+  DATA ls_bdcdata TYPE bdcdata.
+  DATA: lt_bdcdata TYPE TABLE OF bdcdata,
+        lv_mode    TYPE char1 VALUE 'N',
+        lt_return  TYPE TABLE OF bdcmsgcoll,
+        l_msg      TYPE string.
+  lv_menge = alv-menge .
+  CONDENSE lv_menge NO-GAPS.
+  lt_bdcdata = VALUE #( ( program = 'SAPLCORU_S'  dynpro = '0100' dynbegin = 'X' )
+                        ( fnam    = 'BDC_OKCODE'  fval   = '=ENTR' )
+                        ( fnam    = 'BDC_SUBSCR'  fval   = 'SAPLCORU_S                              0010SUB01' )
+                        ( fnam    = 'AFRUD-AUFNR' fval   = alv-aufnr )
+                        ( fnam    = 'AFRUD-VORNR' fval   = alv-vornr )
+                        ( fnam    = 'AFRUD-LMNGA' fval   = lv_menge )
+                        ( fnam    = 'AFRUD-BUDAT' fval   = alv-budat )
+                        ( program = 'SAPLCORU_S'  dynpro = '0100' dynbegin = 'X' )
+                        ( fnam    = 'BDC_OKCODE'  fval   = '=BU' ) ).
+  CALL TRANSACTION 'CO11N' USING lt_bdcdata
+                            MODE lv_mode
+                            UPDATE 'S'
+                            MESSAGES INTO lt_return.
+  LOOP AT lt_return INTO DATA(ls_return)
+    WHERE msgtyp CA 'EA'.
+    CALL FUNCTION 'FORMAT_MESSAGE'
+      EXPORTING
+        id  = ls_return-msgid
+        no  = ls_return-msgnr
+        v1  = ls_return-msgv1
+        v2  = ls_return-msgv2
+        v3  = ls_return-msgv3
+        v4  = ls_return-msgv4
+      IMPORTING
+        msg = l_msg.
+    alv-msg = alv-msg && ';' && l_msg.
+    SHIFT alv-msg LEFT DELETING LEADING ';'.
+    CLEAR ls_return.
+  ENDLOOP.
+  IF sy-subrc EQ 0.
+    alv-icon = icon_led_red.
+  ELSE.
+    alv-icon = icon_led_green.
+    alv-msg = '成功'.
+    SELECT  rueck , rmzhl
+     FROM afru INTO TABLE @DATA(lt_afru)
+     WHERE aufnr = @alv-aufnr
+       AND vornr = @alv-vornr.
+    SORT lt_afru BY rueck rmzhl DESCENDING.
+    READ TABLE lt_afru INTO DATA(ls_afru) INDEX 1.
+    alv-rueck = ls_afru-rueck.
+    alv-rmzhl = ls_afru-rmzhl.
+  ENDIF.
+
+*  DATA: lt_timetickets    TYPE TABLE OF bapi_pp_timeticket,
+*        ls_propose        TYPE bapi_pp_conf_prop,
+*        lt_detail_return  TYPE TABLE OF bapi_coru_return,
+*        lt_goodsmovements TYPE TABLE OF bapi2017_gm_item_create,
+*        lt_goodsmov       TYPE TABLE OF bapi_link_conf_goodsmov,
+*        ls_return         TYPE bapiret1,
+*        lv_message        TYPE bapi_msg.
+*
+*  ls_propose = VALUE #( quantity      = abap_on    "更新数量
+*                        date_and_time = abap_on    "更新作业时间
+*                        goodsmovement = abap_on ). "更新货物移动
+*
+*  lt_timetickets = VALUE #( ( orderid    = alv-aufnr    "工单
+*                              operation  = alv-vornr    "工序
+*                              yield      = alv-menge    "数量
+*                              postg_date = alv-budat    "过账日期
+*                              ) ).
+*
+*  lt_goodsmovements = VALUE #( ( orderid    = alv-aufnr     "生产订单号
+*                                 order_itno = alv-vornr ) )."工序号
+*
+*  CALL FUNCTION 'BAPI_PRODORDCONF_GET_TT_PROP'
+*    EXPORTING
+*      propose            = ls_propose
+*    IMPORTING
+*      return             = ls_return
+*    TABLES
+*      timetickets        = lt_timetickets
+*      goodsmovements     = lt_goodsmovements
+*      link_conf_goodsmov = lt_goodsmov
+*      detail_return      = lt_detail_return.
+*
+*  LOOP AT lt_detail_return INTO DATA(ls_detail_return) WHERE type CA 'EAX'.
+*    lv_message = COND #( WHEN lv_message IS INITIAL THEN ls_detail_return-message ELSE |{ lv_message } ; { ls_detail_return-message }| ).
+*  ENDLOOP.
+*  IF sy-subrc = 0.
+*    alv-icon = icon_led_red.
+*    alv-msg = lv_message.
+*    RETURN.
+*  ENDIF.
+*
+*  CLEAR: lv_message,
+*         lt_detail_return[].
+*
+*  CALL FUNCTION 'BAPI_PRODORDCONF_CREATE_TT'
+*    EXPORTING
+*      post_wrong_entries = '2'
+*      testrun            = ''
+*    IMPORTING
+*      return             = ls_return
+*    TABLES
+*      timetickets        = lt_timetickets
+*      goodsmovements     = lt_goodsmovements
+*      link_conf_goodsmov = lt_goodsmov
+*      detail_return      = lt_detail_return.
+*
+*  LOOP AT lt_detail_return INTO ls_detail_return WHERE type CA 'EAX'.
+*    lv_message = COND #( WHEN lv_message IS INITIAL THEN ls_detail_return-message ELSE |{ lv_message } ; { ls_detail_return-message }| ).
+*  ENDLOOP.
+*  IF sy-subrc = 0.
+*    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+*    alv-icon = icon_led_red.
+*    alv-msg = lv_message.
+*  ELSE.
+*    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+*      EXPORTING
+*        wait = 'X'.
+*    alv-icon = icon_led_green.
+*    alv-msg = |报工完成！|.
+*
+*    SELECT  rueck , rmzhl
+*     FROM afru INTO TABLE @DATA(lt_afru)
+*     WHERE aufnr = @alv-aufnr
+*       AND vornr = @alv-vornr.
+*    SORT lt_afru BY rueck rmzhl DESCENDING.
+*    READ TABLE lt_afru INTO DATA(ls_afru) INDEX 1.
+*    alv-rueck = ls_afru-rueck.
+*    alv-rmzhl = ls_afru-rmzhl.
+*  ENDIF.
+
+ENDFORM.
+
+
+
+FORM frm_call_co13 USING alv TYPE ty_alv.
+
+  DATA :confirmation        TYPE bapi_pp_conf_key-conf_no,
+        confirmationcounter TYPE bapi_pp_conf_key-conf_cnt,
+        ls_return           TYPE bapiret1.
+  CLEAR:confirmation,
+        confirmationcounter,
+        ls_return.
+
+
+  confirmation        = |{ alv-rueck ALPHA = IN }|.
+  confirmationcounter = |{ alv-rmzhl ALPHA = IN }|.
+
+  CALL FUNCTION 'BAPI_PRODORDCONF_CANCEL'
+    EXPORTING
+      confirmation        = confirmation
+      confirmationcounter = confirmationcounter
+    IMPORTING
+      return              = ls_return.
+  IF ls_return-type CA 'EXA'.
+    MESSAGE ID ls_return-id TYPE ls_return-type NUMBER ls_return-number
+    INTO DATA(mtext)  WITH ls_return-message_v1
+                           ls_return-message_v1
+                           ls_return-message_v3
+                           ls_return-message_v4.
+
+    alv-msg = '错误：' && mtext.
+    alv-icon = icon_led_red.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    alv-msg = '成功'.
+    alv-icon = icon_led_green.
+
+*      成功之后保存日志
+*    PERFORM frm_save_log USING alv '冲销'.
+  ENDIF.
+
+
+ENDFORM.
